@@ -97,20 +97,75 @@ static const uint8_t BASE_CREATESESSION[176] = {
 static const uint8_t ACTVSESS_TYPEID[4] = { 0x01, 0x00, 0xd3, 0x01 };
 
 /*
- * build_activate_session_body: construct a minimal ActivateSession request
- * body with anonymous identity (null ExtensionObject).
+ * UserNameIdentityToken ExtensionObject (63 bytes), SecurityPolicy=None.
  *
- * Per OPC UA Part 4 §5.6.3.2 Table 17: a NULL/empty UserIdentityToken
- * (ExtensionObject with ENCODED_NOBODY) is treated as anonymous by the server,
- * bypassing the policyId matching — works with any open62541 server that
- * permits anonymous login, regardless of its configured policyId string.
+ * Lifted verbatim from a working open62541 AFLNet seed that reaches
+ * ActivateSession against the server_ctt target (anonymous login disabled by
+ * default via disableAnonymous(), so a null/anonymous token gets
+ * Bad_IdentityTokenInvalid 0x80200000). Credentials user1/password with
+ * policyId "open62541-username-policy" are the open62541 defaults the target
+ * accepts. Password is plaintext because SecurityPolicy=None.
  *
- * Body layout (27 bytes):
+ * Layout:
+ *   01 00 44 01                TypeId NodeId i=324 (UserNameIdentityToken_Encoding_DefaultBinary)
+ *   01                         encoding = has binary body
+ *   36 00 00 00                bodyLen = 54
+ *     19 00 00 00 "open62541-username-policy"   policyId (String, 25)
+ *     05 00 00 00 "user1"                        userName (String, 5)
+ *     08 00 00 00 "password"                     password (ByteString, 8, plaintext @ None)
+ *     ff ff ff ff                                encryptionAlgorithm (null String)
+ */
+static const uint8_t USERNAME_IDENTITY_TOKEN[] = {
+    0x01, 0x00, 0x44, 0x01, 0x01, 0x36, 0x00, 0x00, 0x00, 0x19, 0x00, 0x00, 0x00,
+    0x6f, 0x70, 0x65, 0x6e, 0x36, 0x32, 0x35, 0x34, 0x31, 0x2d, 0x75, 0x73, 0x65,
+    0x72, 0x6e, 0x61, 0x6d, 0x65, 0x2d, 0x70, 0x6f, 0x6c, 0x69, 0x63, 0x79, 0x05,
+    0x00, 0x00, 0x00, 0x75, 0x73, 0x65, 0x72, 0x31, 0x08, 0x00, 0x00, 0x00, 0x70,
+    0x61, 0x73, 0x73, 0x77, 0x6f, 0x72, 0x64, 0xff, 0xff, 0xff, 0xff,
+};
+
+/*
+ * AnonymousIdentityToken ExtensionObject (49 bytes) for open62541 v1.4.x.
+ *
+ * Captured verbatim from open62541 v1.4.6's own UA_Client connecting anonymously
+ * to a clean (non-fuzzing) v1.4.6 server. v1.4 changed the default anonymous
+ * policyId from "open62541-anonymous-policy" (v1.3.x) to
+ * "open62541-anonymous-policy-none#None" (security-policy suffix appended). A
+ * null/empty token or the short-form policyId is rejected with
+ * Bad_IdentityTokenInvalid (0x80200000); the full suffixed policyId is required.
+ *
+ * NOTE: this only works against a CLEAN v1.4.6 build. afl-gcc auto-defines
+ * FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION, under which open62541 tampers with
+ * auth tokens (ua_server.c) and ActivateSession fails regardless of token.
+ *
+ * Layout:
+ *   01 00 41 01                TypeId NodeId i=321 (AnonymousIdentityToken_Encoding_DefaultBinary)
+ *   01                         encoding = has binary body
+ *   28 00 00 00                bodyLen = 40
+ *     24 00 00 00 "open62541-anonymous-policy-none#None"   policyId (String, 36)
+ */
+static const uint8_t ANON_V14_IDENTITY_TOKEN[] = {
+    0x01, 0x00, 0x41, 0x01, 0x01, 0x28, 0x00, 0x00, 0x00, 0x24, 0x00, 0x00, 0x00,
+    0x6f, 0x70, 0x65, 0x6e, 0x36, 0x32, 0x35, 0x34, 0x31, 0x2d, 0x61, 0x6e, 0x6f,
+    0x6e, 0x79, 0x6d, 0x6f, 0x75, 0x73, 0x2d, 0x70, 0x6f, 0x6c, 0x69, 0x63, 0x79,
+    0x2d, 0x6e, 0x6f, 0x6e, 0x65, 0x23, 0x4e, 0x6f, 0x6e, 0x65,
+};
+
+/*
+ * build_activate_session_body: construct an ActivateSession request body with
+ * a UserName identity token (user1/password).
+ *
+ * The target (server_ctt) disables anonymous login by default, so a null/empty
+ * UserIdentityToken is rejected with Bad_IdentityTokenInvalid. We send the same
+ * UserName token that working AFLNet seeds use. If your target permits
+ * anonymous login, swap USERNAME_IDENTITY_TOKEN for the 3-byte null ExtObj
+ * (00 00 00) instead.
+ *
+ * Body layout (87 bytes):
  *   clientSignature.algorithm  (null String)    4 bytes  ff ff ff ff
  *   clientSignature.signature  (null ByteStr)   4 bytes  ff ff ff ff
  *   clientSoftwareCertificates (null Int32 arr) 4 bytes  ff ff ff ff
  *   localeIds                  (null Int32 arr) 4 bytes  ff ff ff ff
- *   userIdentityToken          (null ExtObj)    3 bytes  00 00 00
+ *   userIdentityToken          (UserName ExtObj) 63 bytes
  *   userTokenSignature.algo    (null String)    4 bytes  ff ff ff ff
  *   userTokenSignature.sig     (null ByteStr)   4 bytes  ff ff ff ff
  */
@@ -123,13 +178,31 @@ static void build_activate_session_body(uint8_t *body, uint32_t *body_len) {
     body[off++]=0xff; body[off++]=0xff; body[off++]=0xff; body[off++]=0xff;
     /* localeIds: null array */
     body[off++]=0xff; body[off++]=0xff; body[off++]=0xff; body[off++]=0xff;
-    /* userIdentityToken: null ExtensionObject (ENCODED_NOBODY).
-     * Null NodeId (TwoByte encoding: 00 00) + encoding byte 0x00 = 3 bytes */
-    body[off++]=0x00; body[off++]=0x00; body[off++]=0x00;
+    /* userIdentityToken: 環境変数で切り替え可能 (ベンダーごとの auth 差に対応):
+     *   OPCUA_LIFT_ANON=1     → 匿名 (null ExtObj 3B)。anon 許可サーバ向け。
+     *   OPCUA_LIFT_TOKEN_HEX  → 任意トークンを hex で指定 (working seed から抽出した値)。
+     *   既定                  → UserName token (user1/password)。 */
+    const char *anon = getenv("OPCUA_LIFT_ANON");
+    const char *thex = getenv("OPCUA_LIFT_TOKEN_HEX");
+    const char *anon14 = getenv("OPCUA_LIFT_ANON_V14");
+    if (anon && anon[0] == '1') {
+        body[off++]=0x00; body[off++]=0x00; body[off++]=0x00;  /* null ExtObj */
+    } else if (anon14 && anon14[0] == '1') {
+        /* open62541 v1.4.x clean build: anonymous with suffixed policyId */
+        memcpy(body + off, ANON_V14_IDENTITY_TOKEN, sizeof(ANON_V14_IDENTITY_TOKEN));
+        off += (uint32_t)sizeof(ANON_V14_IDENTITY_TOKEN);
+    } else if (thex && thex[0]) {
+        for (const char *p = thex; p[0] && p[1]; p += 2) {
+            unsigned v; sscanf(p, "%2x", &v); body[off++] = (uint8_t)v;
+        }
+    } else {
+        memcpy(body + off, USERNAME_IDENTITY_TOKEN, sizeof(USERNAME_IDENTITY_TOKEN));
+        off += (uint32_t)sizeof(USERNAME_IDENTITY_TOKEN);
+    }
     /* userTokenSignature (null SignatureData) */
     body[off++]=0xff; body[off++]=0xff; body[off++]=0xff; body[off++]=0xff;
     body[off++]=0xff; body[off++]=0xff; body[off++]=0xff; body[off++]=0xff;
-    *body_len = off;  /* = 27 bytes */
+    *body_len = off;
 }
 
 /* -----------------------------------------------------------------------
@@ -576,8 +649,8 @@ int main(int argc, char *argv[]) {
         uint8_t *rh = build_request_header(auth_tok, auth_tok_len, 3, &rh_len);
         if (!rh) { fprintf(stderr, "[opcua-lift] OOM\n"); goto done; }
 
-        /* Build body: minimal anonymous identity (null ExtensionObject) */
-        uint8_t as_body[64];
+        /* Build body: UserName identity token (user1/password). 87 bytes. */
+        uint8_t as_body[128];
         uint32_t as_body_len;
         build_activate_session_body(as_body, &as_body_len);
 
@@ -677,10 +750,34 @@ int main(int argc, char *argv[]) {
                 fprintf(stderr, "\n");
                 ck_free(codes);
             }
-            /* Raw response bytes (same as aflnet-replay) */
-            for (uint32_t i = 0; i < response_buf_size; i++)
-                fputc(response_buf[i], stderr);
+            /* Raw response bytes → STDOUT (binary-clean, so callers can capture
+             * the MSG response without parsing it out of stderr diagnostics).
+             * state codes stay on stderr. */
+            fwrite(response_buf, 1, response_buf_size, stdout);
+            fflush(stdout);
             free(response_buf);
+        }
+    }
+
+    /* ---- Step 7: CloseSession (clean teardown) ----
+     * opcua-lift は本来セッションを張りっぱなしで切断していたため、エージェントが
+     * 毎サイクル数十回 replay するとサーバ側にセッションが溜まり Bad_TooManySessions
+     * (0x80560000) で CreateSession が失敗するようになっていた。明示的に CloseSession
+     * を送ってセッションを解放する。応答は待たない (teardown なので best-effort)。
+     * CloseSession Request TypeId = NodeId 473 (0x01D9, FourByte)。
+     * body = deleteSubscriptions (Boolean, 1B)。 */
+    {
+        static const uint8_t CLOSESESS_TYPEID[4] = { 0x01, 0x00, 0xd9, 0x01 };
+        uint32_t rh_len;
+        uint8_t *rh = build_request_header(auth_tok, auth_tok_len, 5, &rh_len);
+        if (rh) {
+            uint8_t cs_body[1] = { 0x01 };  /* deleteSubscriptions = true */
+            uint32_t cs_len;
+            uint8_t *cs = build_msg(channel_id, token_id, 5, 5,
+                                    CLOSESESS_TYPEID, 4, rh, rh_len,
+                                    cs_body, 1, &cs_len);
+            free(rh);
+            if (cs) { (void)send_all(sockfd, cs, cs_len); free(cs); }
         }
     }
 
