@@ -9,7 +9,7 @@
 #   host:    target host                     (default: 127.0.0.1)
 #
 # NodeId map (open62541 v1.3.x binary service request TypeIds):
-#   read=631  write=673  browse=527  call=713
+#   read=631  write=673  browse=527  call=712
 set -euo pipefail
 
 if [ "${1:-}" = "--help" ] || [ $# -lt 2 ]; then
@@ -26,7 +26,7 @@ case "$SERVICE" in
   read)   NODE_ID=631 ;;
   write)  NODE_ID=673 ;;
   browse) NODE_ID=527 ;;
-  call)   NODE_ID=713 ;;
+  call)   NODE_ID=712 ;;
   *) echo "[replay] Unsupported service: $SERVICE (use read|write|browse|call)" >&2; exit 2 ;;
 esac
 

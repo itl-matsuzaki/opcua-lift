@@ -76,7 +76,10 @@ make clean
 | read    | 631 |
 | write   | 673 |
 | browse  | 527 |
-| call    | 713 |
+| call    | 712 |
+
+> `call` は **712**（`CallRequest_Encoding_DefaultBinary`）です。713 は
+> `CallResponse` の非符号化 NodeId なので要求には使えません（以前 713 と書いていました）。
 
 `replay.sh` を使えば service 名で指定できます:
 
