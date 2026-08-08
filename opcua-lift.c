@@ -275,6 +275,9 @@ static int send_all(int sockfd, const uint8_t *buf, uint32_t len) {
  * are masked out; namespace-URI and server-index extensions are not present
  * in normal in-band NodeIds returned by open62541).
  */
+/* max wire length of an authToken NodeId (Milo opaque = 39B; margin for larger) */
+#define AUTH_TOK_MAX 128
+
 static uint32_t nodeid_wire_len(const uint8_t *buf, uint32_t len, uint32_t off) {
     if (off >= len) return 0;
     uint8_t enc = buf[off] & 0x3f;  /* lower 6 bits = base encoding */
@@ -297,6 +300,80 @@ static uint32_t nodeid_wire_len(const uint8_t *buf, uint32_t len, uint32_t off) 
         }
         default: return 0;
     }
+}
+
+
+/*
+ * skip_diagnostic_info / skip_response_header
+ *
+ * ResponseHeader is VARIABLE length.  serviceDiagnostics (DiagnosticInfo),
+ * stringTable (String[]) and additionalHeader (ExtensionObject) all grow.
+ * Assuming a fixed 24 bytes works only for the minimal form that open62541
+ * happens to send; any server returning diagnostics or a non-empty
+ * stringTable shifts sessionId/authToken and the session then fails with a
+ * decoding error that looks like a target bug.
+ *
+ * Returns the new offset, or 0 on failure (fail closed).
+ */
+static uint32_t skip_diagnostic_info(const uint8_t *buf, uint32_t len,
+                                     uint32_t off, int depth) {
+    if (depth > 8 || off >= len) return 0;
+    uint8_t mask = buf[off++];
+    if (mask & 0x80) return 0;                 /* reserved bit */
+    /* bits 0..3 (SymbolicId, NamespaceUri, LocalizedText, Locale) are Int32.
+     * They are all 4 bytes, so their relative wire order does not matter here. */
+    for (int b = 0; b < 4; b++) {
+        if (mask & (1u << b)) { if (off + 4 > len) return 0; off += 4; }
+    }
+    if (mask & 0x10) {                          /* AdditionalInfo (String) */
+        if (off + 4 > len) return 0;
+        int32_t n = (int32_t)rd_le32(buf + off); off += 4;
+        if (n > 0) { if (off + (uint32_t)n > len) return 0; off += (uint32_t)n; }
+    }
+    if (mask & 0x20) { if (off + 4 > len) return 0; off += 4; }  /* InnerStatusCode */
+    if (mask & 0x40) {                          /* InnerDiagnosticInfo (recursive) */
+        off = skip_diagnostic_info(buf, len, off, depth + 1);
+        if (off == 0) return 0;
+    }
+    return off;
+}
+
+static uint32_t skip_response_header(const uint8_t *buf, uint32_t len,
+                                     uint32_t off, uint32_t *service_result) {
+    if (off + 16 > len) return 0;
+    off += 8;                                   /* timestamp   */
+    off += 4;                                   /* requestHandle */
+    if (service_result) *service_result = rd_le32(buf + off);
+    off += 4;                                   /* serviceResult */
+
+    off = skip_diagnostic_info(buf, len, off, 0);
+    if (off == 0) return 0;
+
+    /* stringTable (String[]) */
+    if (off + 4 > len) return 0;
+    int32_t nstr = (int32_t)rd_le32(buf + off); off += 4;
+    if (nstr > 0) {
+        for (int32_t i = 0; i < nstr; i++) {
+            if (off + 4 > len) return 0;
+            int32_t sl = (int32_t)rd_le32(buf + off); off += 4;
+            if (sl > 0) { if (off + (uint32_t)sl > len) return 0; off += (uint32_t)sl; }
+        }
+    }
+
+    /* additionalHeader (ExtensionObject: NodeId + encoding + optional body) */
+    uint32_t nl = nodeid_wire_len(buf, len, off);
+    if (nl == 0) return 0;
+    off += nl;
+    if (off >= len) return 0;
+    uint8_t enc = buf[off++];
+    if (enc == 0x01 || enc == 0x02) {
+        if (off + 4 > len) return 0;
+        int32_t bl = (int32_t)rd_le32(buf + off); off += 4;
+        if (bl > 0) { if (off + (uint32_t)bl > len) return 0; off += (uint32_t)bl; }
+    } else if (enc != 0x00) {
+        return 0;                               /* undefined encoding */
+    }
+    return off;
 }
 
 /*
@@ -342,11 +419,9 @@ static int parse_opn_response(const uint8_t *buf, uint32_t len,
     if (nlen == 0) return -1;
     off += nlen;
 
-    /* ResponseHeader: timestamp(8) + requestHandle(4) + serviceResult(4)
-     *   + serviceDiagnostics(1=0x00) + stringTable(4=-1) + additionalHeader(3)
-     * = 24 bytes for the typical open62541 None-security response */
-    if (off + 24 > len) return -1;
-    off += 24;
+    /* ResponseHeader (VARIABLE length - see skip_response_header) */
+    off = skip_response_header(buf, len, off, NULL);
+    if (off == 0) return -1;
 
     /* serverProtocolVersion (UInt32) */
     if (off + 4 > len) return -1;
@@ -368,12 +443,15 @@ static int parse_opn_response(const uint8_t *buf, uint32_t len,
  *
  * Layout after 24-byte transport header:
  *   TypeId (NodeId, 4 bytes for enc=0x01)
- *   ResponseHeader (24 bytes, simple case)
+ *   ResponseHeader (variable length; walked by skip_response_header)
  *   sessionId (NodeId, variable)
  *   authToken (NodeId, variable) <- we want this
  *
  * Returns 0 on success; -1 on parse error; -2 on bad StatusCode.
- * auth_tok must be at least 32 bytes.
+ * auth_tok must be at least AUTH_TOK_MAX bytes.  Servers differ widely here:
+ * open62541 issues a short numeric NodeId, while Eclipse Milo issues an opaque
+ * (ByteString) NodeId carrying 32 random bytes = 39 bytes on the wire.  Both are
+ * spec-conformant, so the buffer must accommodate the larger opaque form.
  */
 static int parse_create_session_resp(const uint8_t *buf, uint32_t len,
                                       uint8_t *auth_tok, uint32_t *auth_tok_len) {
@@ -385,12 +463,11 @@ static int parse_create_session_resp(const uint8_t *buf, uint32_t len,
     if (nlen == 0) return -1;
     off += nlen;
 
-    /* ResponseHeader (24 bytes): timestamp(8)+handle(4)+serviceResult(4)+
-     * serviceDiag(1)+stringTable(4)+additionalHeader(3) */
-    if (off + 24 > len) return -1;
-    uint32_t status = rd_le32(buf + off + 12);  /* serviceResult at +12 */
+    /* ResponseHeader (VARIABLE length - see skip_response_header) */
+    uint32_t status = 0;
+    off = skip_response_header(buf, len, off, &status);
+    if (off == 0) return -1;
     if (status != 0) return -2;
-    off += 24;
 
     /* sessionId (NodeId) - skip */
     nlen = nodeid_wire_len(buf, len, off);
@@ -399,7 +476,7 @@ static int parse_create_session_resp(const uint8_t *buf, uint32_t len,
 
     /* authToken (NodeId) */
     nlen = nodeid_wire_len(buf, len, off);
-    if (nlen == 0 || nlen > 32) return -1;
+    if (nlen == 0 || nlen > AUTH_TOK_MAX) return -1;
     if (off + nlen > len) return -1;  /* bounds check before memcpy */
     *auth_tok_len = nlen;
     memcpy(auth_tok, buf + off, nlen);
@@ -559,14 +636,21 @@ int main(int argc, char *argv[]) {
     }
     freeaddrinfo(res);
 
-    /* Set 5-second recv timeout to avoid hanging under ASAN overhead */
-    struct timeval tv = {5, 0};
+    /* Recv timeout (default 5s, avoids hanging under ASAN overhead).  Overridable
+     * via OPCUA_LIFT_TIMEOUT (seconds): JVM-backed servers such as Eclipse Milo can
+     * be slow to answer HEL when sessions are opened in rapid succession, and a
+     * short timeout shows up as a spurious "HEL/ACK failed: no response".
+     * This only changes how long the client waits — never what the server sends. */
+    long timeout_s = 5;
+    { const char *t = getenv("OPCUA_LIFT_TIMEOUT");
+      if (t && *t) { long v = strtol(t, NULL, 10); if (v > 0 && v <= 300) timeout_s = v; } }
+    struct timeval tv = {timeout_s, 0};
     setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     int rc = 1;  /* assume failure until MSG send succeeds */
     uint8_t *resp = NULL;
     uint32_t resp_len = 0;
-    uint8_t auth_tok[32];
+    uint8_t auth_tok[AUTH_TOK_MAX];
     uint32_t auth_tok_len = 0;
     uint32_t channel_id = 0, token_id = 0;
 

@@ -88,6 +88,35 @@ make clean
 # 例: ./replay.sh testcases/readrequest_body.raw 4840 read 127.0.0.1
 ```
 
+### 環境変数
+
+ActivateSession の身元確認トークンは実装ごとに受け付ける形が違います。**実装ごとの
+作業はこの切り替えだけ**です。
+
+| 変数 | 効果 |
+|------|------|
+| `OPCUA_LIFT_ANON=1` | userIdentityToken を null ExtensionObject（`00 00 00`）にする |
+| `OPCUA_LIFT_ANON_V14=1` | open62541 v1.4.x の匿名 policyId を持つ ExtensionObject を送る |
+| `OPCUA_LIFT_TOKEN_HEX=<hex>` | userIdentityToken を生バイトで直接指定する |
+| `OPCUA_LIFT_TIMEOUT=<秒>` | recv タイムアウト（既定 5、上限 300） |
+
+トークンの優先順位は `ANON` → `ANON_V14` → `TOKEN_HEX` → 既定（UserName `user1/password`）です。
+
+実測（サンプル corpus を replay して `0-0-` が出る設定）:
+
+| 実装 | 設定 |
+|------|------|
+| open62541 v1.4.x | `OPCUA_LIFT_ANON_V14=1` |
+| open62541 v1.3.x | 既定（username）または `OPCUA_LIFT_ANON=1` |
+| Eclipse Milo | `OPCUA_LIFT_ANON=1` |
+| UA-.NETStandard | `OPCUA_LIFT_ANON=1` または `OPCUA_LIFT_ANON_V14=1` |
+
+合わないと `ActivateSession failed: bad StatusCode 0x80200000`
+（`BadIdentityTokenInvalid`）で止まります。**これを「対象実装が弱い」と読まないこと。**
+
+JVM 実装（Milo）はセッションを連続して張ると HEL の応答が遅れることがあり、既定の 5 秒
+では `HEL/ACK failed: no response` に見えます。`OPCUA_LIFT_TIMEOUT` を伸ばしてください。
+
 ### 出力
 
 `stderr` に以下を出力します（`aflnet-replay` と同じ並び）:
