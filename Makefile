@@ -33,6 +33,17 @@ opcua_state.o: opcua_state.c alloc-shim.h
 	$(CC) $(CFLAGS) -c opcua_state.c -o $@
 
 clean:
-	rm -f opcua-lift $(OBJS)
+	rm -f opcua-lift test_response_header $(OBJS)
 
 .PHONY: all clean
+
+# Regression test pinning the variable-length ResponseHeader walk.  It includes
+# opcua-lift.c directly so the static parsers can be exercised without a server.
+# Reverting to the old fixed 24-byte assumption fails 6 of the 8 checks.
+test: test_response_header
+	./test_response_header
+
+test_response_header: test_response_header.c opcua-lift.c opcua_state.c alloc-shim.h
+	$(CC) $(CFLAGS) -o $@ test_response_header.c opcua_state.c $(LDFLAGS)
+
+.PHONY: test

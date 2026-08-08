@@ -14,6 +14,13 @@ corpus ファイルの中身は、最後の `MSG` の**ボディ部分のバイ�
 tokenId, seqNum, requestId, authToken）は実行時にサーバ応答から取得してパッチします。
 これが「ステートフル replay」の本体です。
 
+`--multi` を使うと、1 セッションで**複数のサービス要求を順に流し**、要求と応答を対にして
+取り出せます（[複数サービスモード](#複数サービスモードmulti)）。
+
+```
+HEL ─▶ ACK ─▶ OPN ─▶ CreateSession ─▶ ActivateSession ─▶ [サービス列] ─▶ CloseSession
+```
+
 ---
 
 ## なぜこの形なのか（切り出しの方針）
@@ -58,8 +65,11 @@ make clean
 
 ## 使い方
 
+モードは 2 つあります。単一サービス（従来）と、1 セッションで要求列を流す `--multi` です。
+
 ```sh
-./opcua-lift <corpus_file> <port> [node_id [host]]
+./opcua-lift <corpus_file> <port> [node_id [host]]      # 単一サービス
+./opcua-lift --multi <script_file> <port> [host]        # 複数サービス
 ```
 
 | 引数 | 説明 | 既定値 |
@@ -76,7 +86,10 @@ make clean
 | read    | 631 |
 | write   | 673 |
 | browse  | 527 |
-| call    | 713 |
+| call    | 712 |
+
+> `call` は **712**（`CallRequest_Encoding_DefaultBinary`）です。713 は
+> `CallResponse` の非符号化 NodeId なので要求には使えません（以前 713 と書いていました）。
 
 `replay.sh` を使えば service 名で指定できます:
 
@@ -84,6 +97,61 @@ make clean
 ./replay.sh <corpus_file> <port> [read|write|browse|call] [host]
 # 例: ./replay.sh testcases/readrequest_body.raw 4840 read 127.0.0.1
 ```
+
+### 複数サービスモード（`--multi`）
+
+アプリケーション層のある対象では、**1 セッション 1 MSG では届かない状態**があります。
+興味のある状態は列でしか作れないからです（SetPoint を書いてから読み戻す、メソッドを
+呼んでから状態機械を観測する、など）。要求 1 件につき状態が 1 歩進む対象なら、N 歩先の
+状態は単一サービスモードでは原理的に到達できません。
+
+`--multi` では、スクリプト内の全要求を **1 つのセッション**で順に送り、**要求と応答を
+対にして**返します。
+
+```text
+script : u32 node_id ; u32 body_len ; u8 body[body_len]                の繰り返し
+stdout : u32 magic("LIFT"=0x5446494c) ; u32 node_id ; u32 resp_len ; u8 resp[]  の繰り返し
+```
+
+- 整数はすべてリトルエンディアン。`body` は単一サービスモードと同じ
+  **RequestHeader を除いたサービス固有ボディ**です。
+- `resp_len == 0` は「そのサービスに応答が返らなかった」という**情報**であり、失敗では
+  ありません。列はそこで打ち切らず、後続の要求を送り続けます。
+- `seqNum` / `requestId` はセッション全体で単調増加します。末尾の `CloseSession` も
+  その続きを使います（固定値のままだと巻き戻ってサーバに拒否されます）。
+- 応答が `MSGC` で分割されて届いた場合は `MSGF` まで読んで 1 応答にまとめます。
+
+単一サービスモードの出力契約は変わりません（生の応答バイト列をそのまま stdout に出す）。
+既存の呼び出し側は影響を受けません。
+
+### 環境変数
+
+ActivateSession の身元確認トークンは実装ごとに受け付ける形が違います。**実装ごとの
+作業はこの切り替えだけ**です。
+
+| 変数 | 効果 |
+|------|------|
+| `OPCUA_LIFT_ANON=1` | userIdentityToken を null ExtensionObject（`00 00 00`）にする |
+| `OPCUA_LIFT_ANON_V14=1` | open62541 v1.4.x の匿名 policyId を持つ ExtensionObject を送る |
+| `OPCUA_LIFT_TOKEN_HEX=<hex>` | userIdentityToken を生バイトで直接指定する |
+| `OPCUA_LIFT_TIMEOUT=<秒>` | recv タイムアウト（既定 5、上限 300） |
+
+トークンの優先順位は `ANON` → `ANON_V14` → `TOKEN_HEX` → 既定（UserName `user1/password`）です。
+
+実測（サンプル corpus を replay して `0-0-` が出る設定）:
+
+| 実装 | 設定 |
+|------|------|
+| open62541 v1.4.x | `OPCUA_LIFT_ANON_V14=1` |
+| open62541 v1.3.x | 既定（username）または `OPCUA_LIFT_ANON=1` |
+| Eclipse Milo | `OPCUA_LIFT_ANON=1` |
+| UA-.NETStandard | `OPCUA_LIFT_ANON=1` または `OPCUA_LIFT_ANON_V14=1` |
+
+合わないと `ActivateSession failed: bad StatusCode 0x80200000`
+（`BadIdentityTokenInvalid`）で止まります。**これを「対象実装が弱い」と読まないこと。**
+
+JVM 実装（Milo）はセッションを連続して張ると HEL の応答が遅れることがあり、既定の 5 秒
+では `HEL/ACK failed: no response` に見えます。`OPCUA_LIFT_TIMEOUT` を伸ばしてください。
 
 ### 出力
 
