@@ -11,8 +11,28 @@
  *   node_id       Optional: decimal service NodeId (default: 631 = ReadRequest)
  *   host          Optional: server hostname or IP (default: 127.0.0.1)
  *
+ * Multi-service mode:
+ *   ./opcua-lift --multi <script_file> <port> [host]
+ *
+ * One MSG per session is not enough for a SUT with an application layer: the
+ * interesting states are reached by *sequences* (write a SetPoint then read it
+ * back; call a method then observe the state machine).  When the SUT advances
+ * its state once per request, a state that is N requests deep is unreachable
+ * with one MSG per session.  In multi-service mode every request in
+ * the script is driven over ONE session, and every response is returned paired
+ * with the request that produced it.
+ *
+ * Script format (all integers little-endian, records back to back):
+ *   u32 node_id ; u32 body_len ; u8 body[body_len]
+ *
+ * Multi-service stdout format (one record per request, in order):
+ *   u32 magic 0x5446494cL ("LIFT") ; u32 node_id ; u32 resp_len ; u8 resp[resp_len]
+ * resp_len == 0 means the server did not answer that request (a timeout is
+ * information, not a failure).  Single-service mode still writes the raw
+ * response bytes to stdout unchanged, so existing callers are unaffected.
+ *
  * Exit codes:
- *   0  Session established and MSG sent; response codes printed to stderr
+ *   0  Session established and MSG(s) sent; response codes printed to stderr
  *   1  Handshake failed at any step
  *   2  Usage error
  */
@@ -568,16 +588,104 @@ static uint8_t *build_request_header(const uint8_t *auth_tok, uint32_t auth_tok_
  * Main
  * ----------------------------------------------------------------------- */
 
+/* One service request to drive over the session. */
+typedef struct {
+    uint32_t node_id;
+    uint8_t *body;
+    uint32_t body_len;
+} lift_service_t;
+
+#define LIFT_MULTI_MAGIC  0x5446494cu   /* "LIFT" little-endian */
+#define LIFT_MAX_SERVICES 4096u
+
+static void free_services(lift_service_t *svcs, uint32_t n) {
+    if (!svcs) return;
+    for (uint32_t i = 0; i < n; i++) free(svcs[i].body);
+    free(svcs);
+}
+
+/* Parse the multi-service script: repeated {u32 node_id, u32 body_len, body}. */
+static int parse_script(const uint8_t *buf, uint32_t len,
+                        lift_service_t **out, uint32_t *out_n) {
+    lift_service_t *svcs = NULL;
+    uint32_t n = 0, off = 0;
+    while (off + 8 <= len) {
+        uint32_t node_id = rd_le32(buf + off);
+        uint32_t body_len = rd_le32(buf + off + 4);
+        off += 8;
+        if (body_len > len - off) goto bad;         /* no overflow: body_len vs remaining */
+        if (n >= LIFT_MAX_SERVICES) goto bad;
+        lift_service_t *tmp = realloc(svcs, (n + 1) * sizeof(*svcs));
+        if (!tmp) goto bad;
+        svcs = tmp;
+        svcs[n].node_id = node_id;
+        svcs[n].body_len = body_len;
+        svcs[n].body = NULL;
+        if (body_len > 0) {
+            svcs[n].body = malloc(body_len);
+            if (!svcs[n].body) { n++; goto bad; }
+            memcpy(svcs[n].body, buf + off, body_len);
+        }
+        off += body_len;
+        n++;
+    }
+    if (off != len || n == 0) goto bad;             /* trailing bytes = malformed script */
+    *out = svcs;
+    *out_n = n;
+    return 0;
+bad:
+    free_services(svcs, n);
+    return -1;
+}
+
+/* Receive one logical service response: keep reading while the server sends
+ * intermediate chunks (MSGC ...) until the final chunk (MSGF) arrives.  Returns
+ * 0 and a freshly allocated buffer, or -1 if nothing could be read. */
+static int recv_service_response(int sockfd, uint8_t **out, uint32_t *out_len) {
+    uint8_t *acc = NULL;
+    uint32_t acc_len = 0;
+    for (;;) {
+        uint8_t *chunk = NULL;
+        uint32_t chunk_len = 0;
+        if (recv_opcua_msg(sockfd, &chunk, &chunk_len) < 0) break;
+        uint8_t *tmp = realloc(acc, acc_len + chunk_len);
+        if (!tmp) { free(chunk); break; }
+        acc = tmp;
+        memcpy(acc + acc_len, chunk, chunk_len);
+        acc_len += chunk_len;
+        int is_intermediate = (chunk_len >= 4 && memcmp(chunk, "MSG", 3) == 0
+                               && chunk[3] == 'C');
+        free(chunk);
+        if (!is_intermediate) break;                /* MSGF / ERR / anything final */
+    }
+    if (!acc) return -1;
+    *out = acc;
+    *out_len = acc_len;
+    return 0;
+}
+
 int main(int argc, char *argv[]) {
-    if (argc < 3) {
-        fprintf(stderr, "Usage: %s <corpus_file> <port> [node_id [host]]\n", argv[0]);
+    int multi = (argc >= 2 && strcmp(argv[1], "--multi") == 0);
+    int base = multi ? 1 : 0;                       /* shift for the flag */
+
+    if (argc < 3 + base) {
+        fprintf(stderr,
+                "Usage: %s <corpus_file> <port> [node_id [host]]\n"
+                "       %s --multi <script_file> <port> [host]\n",
+                argv[0], argv[0]);
         return 2;
     }
 
-    const char *corpus_file = argv[1];
-    int port = atoi(argv[2]);
-    uint32_t node_id = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 631;
-    const char *host = (argc >= 5) ? argv[4] : "127.0.0.1";
+    const char *corpus_file = argv[1 + base];
+    int port = atoi(argv[2 + base]);
+    uint32_t node_id = 631;
+    const char *host = "127.0.0.1";
+    if (multi) {
+        if (argc >= 5) host = argv[4];
+    } else {
+        if (argc >= 4) node_id = (uint32_t)atoi(argv[3]);
+        if (argc >= 5) host = argv[4];
+    }
 
     if (port <= 0 || port > 65535) {
         fprintf(stderr, "[opcua-lift] Usage error: invalid port %d\n", port);
@@ -607,6 +715,26 @@ int main(int argc, char *argv[]) {
         fuzz_len = (uint32_t)fread(fuzz_body, 1, (size_t)fsize, fp);
     }
     fclose(fp);
+
+    /* In multi mode the file is a script; in single mode it is one raw body.
+     * Both end up as an array of services so step 5 has one code path. */
+    lift_service_t *services = NULL;
+    uint32_t n_services = 0;
+    if (multi) {
+        if (parse_script(fuzz_body, fuzz_len, &services, &n_services) < 0) {
+            fprintf(stderr, "[opcua-lift] Usage error: malformed --multi script\n");
+            free(fuzz_body);
+            return 2;
+        }
+    } else {
+        services = calloc(1, sizeof(*services));
+        if (!services) { free(fuzz_body); return 1; }
+        services[0].node_id = node_id;
+        services[0].body = fuzz_body;               /* ownership moves to services */
+        services[0].body_len = fuzz_len;
+        fuzz_body = NULL;
+        n_services = 1;
+    }
 
     /* --- Connect --- */
     struct addrinfo hints, *res;
@@ -653,6 +781,7 @@ int main(int argc, char *argv[]) {
     uint8_t auth_tok[AUTH_TOK_MAX];
     uint32_t auth_tok_len = 0;
     uint32_t channel_id = 0, token_id = 0;
+    uint32_t close_seq = 5;   /* サービス列を流した後の次の seqNum */
 
     /* ---- Step 1: HEL ---- */
     if (send_all(sockfd, BASE_HEL, sizeof(BASE_HEL)) < 0) {
@@ -775,72 +904,87 @@ int main(int argc, char *argv[]) {
     }
     free(resp); resp = NULL;
 
-    /* ---- Step 5: Send fuzz MSG ---- */
+    /* ---- Step 5/6: Drive every service over this one session ----
+     *
+     * seqNum and reqId must keep increasing across the whole session (steps 1-4
+     * used 1..3), so the counter starts at 4 and advances per request.  A
+     * request that gets no answer is recorded with resp_len == 0 rather than
+     * aborting the script: the caller needs to know *which* request went
+     * unanswered, and later requests may still succeed. */
     {
-        /* NodeId encoding: two-byte numeric (enc=0x01) for IDs <= 65535 */
-        uint8_t nodeid_bytes[4];
-        nodeid_bytes[0] = 0x01;  /* FourByte numeric NodeId */
-        nodeid_bytes[1] = 0x00;  /* namespace = 0 */
-        nodeid_bytes[2] = node_id & 0xff;
-        nodeid_bytes[3] = (node_id >> 8) & 0xff;
+        uint32_t seq = 4;
+        for (uint32_t i = 0; i < n_services; i++) {
+            uint32_t sid = services[i].node_id;
 
-        uint32_t rh_len;
-        uint8_t *rh = build_request_header(auth_tok, auth_tok_len, 4, &rh_len);
-        if (!rh) { fprintf(stderr, "[opcua-lift] OOM\n"); goto done; }
+            /* NodeId encoding: FourByte numeric (enc=0x01) for IDs <= 65535 */
+            uint8_t nodeid_bytes[4];
+            nodeid_bytes[0] = 0x01;
+            nodeid_bytes[1] = 0x00;
+            nodeid_bytes[2] = sid & 0xff;
+            nodeid_bytes[3] = (sid >> 8) & 0xff;
 
-        uint32_t msg_len;
-        uint8_t *msg = build_msg(channel_id, token_id, 4, 4,
-                                  nodeid_bytes, 4,
-                                  rh, rh_len,
-                                  fuzz_body, fuzz_len,
-                                  &msg_len);
-        free(rh);
-        if (!msg) { fprintf(stderr, "[opcua-lift] OOM\n"); goto done; }
-        int sr = send_all(sockfd, msg, msg_len);
-        free(msg);
-        if (sr < 0) {
-            fprintf(stderr, "[opcua-lift] MSG send failed\n");
-            goto done;
-        }
-    }
+            uint32_t rh_len;
+            uint8_t *rh = build_request_header(auth_tok, auth_tok_len, seq, &rh_len);
+            if (!rh) { fprintf(stderr, "[opcua-lift] OOM\n"); goto done; }
 
-    /* ---- Step 6: Collect response and print state codes ---- */
-    {
-        /* Drain response with poll-like timeout semantics: try recv_opcua_msg
-         * (SO_RCVTIMEO already set to 5s above).  Collect all bytes received. */
-        uint8_t *response_buf = NULL;
-        uint32_t response_buf_size = 0;
-
-        uint8_t *chunk = NULL;
-        uint32_t chunk_len = 0;
-        while (recv_opcua_msg(sockfd, &chunk, &chunk_len) == 0) {
-            uint8_t *tmp = realloc(response_buf, response_buf_size + chunk_len);
-            if (!tmp) { free(chunk); break; }
-            response_buf = tmp;
-            memcpy(response_buf + response_buf_size, chunk, chunk_len);
-            response_buf_size += chunk_len;
-            free(chunk); chunk = NULL;
-            /* Only one MSG response expected; stop after first complete message */
-            break;
-        }
-
-        if (response_buf && response_buf_size > 0) {
-            unsigned int state_count = 0;
-            unsigned int *codes = extract_response_codes_opcua(
-                (unsigned char *)response_buf, response_buf_size, &state_count);
-            if (codes) {
-                for (unsigned int i = 0; i < state_count; i++)
-                    fprintf(stderr, "%u-", codes[i]);
-                fprintf(stderr, "\n");
-                ck_free(codes);
+            uint32_t msg_len;
+            uint8_t *msg = build_msg(channel_id, token_id, seq, seq,
+                                      nodeid_bytes, 4,
+                                      rh, rh_len,
+                                      services[i].body, services[i].body_len,
+                                      &msg_len);
+            free(rh);
+            if (!msg) { fprintf(stderr, "[opcua-lift] OOM\n"); goto done; }
+            int sr = send_all(sockfd, msg, msg_len);
+            free(msg);
+            if (sr < 0) {
+                fprintf(stderr, "[opcua-lift] MSG send failed at service %u (id=%u)\n",
+                        i, sid);
+                goto done;
             }
-            /* Raw response bytes → STDOUT (binary-clean, so callers can capture
-             * the MSG response without parsing it out of stderr diagnostics).
-             * state codes stay on stderr. */
-            fwrite(response_buf, 1, response_buf_size, stdout);
-            fflush(stdout);
+            seq++;
+
+            uint8_t *response_buf = NULL;
+            uint32_t response_buf_size = 0;
+            if (recv_service_response(sockfd, &response_buf, &response_buf_size) < 0) {
+                response_buf = NULL;
+                response_buf_size = 0;
+            }
+
+            if (response_buf && response_buf_size > 0) {
+                unsigned int state_count = 0;
+                unsigned int *codes = extract_response_codes_opcua(
+                    (unsigned char *)response_buf, response_buf_size, &state_count);
+                if (codes) {
+                    for (unsigned int k = 0; k < state_count; k++)
+                        fprintf(stderr, "%u-", codes[k]);
+                    ck_free(codes);
+                }
+            }
+
+            if (multi) {
+                /* Framed record so the caller can pair request with response
+                 * even when a service answered with nothing or with several
+                 * chunks. */
+                uint8_t hdr[12];
+                wr_le32(hdr + 0, LIFT_MULTI_MAGIC);
+                wr_le32(hdr + 4, sid);
+                wr_le32(hdr + 8, response_buf_size);
+                fwrite(hdr, 1, sizeof(hdr), stdout);
+                if (response_buf_size > 0)
+                    fwrite(response_buf, 1, response_buf_size, stdout);
+            } else if (response_buf_size > 0) {
+                /* Single-service mode keeps the original contract: raw response
+                 * bytes on stdout, nothing else. */
+                fwrite(response_buf, 1, response_buf_size, stdout);
+            }
             free(response_buf);
         }
+        fprintf(stderr, "\n");
+        fflush(stdout);
+
+        /* CloseSession below continues the same counter. */
+        close_seq = seq;
     }
 
     /* ---- Step 7: CloseSession (clean teardown) ----
@@ -849,15 +993,17 @@ int main(int argc, char *argv[]) {
      * (0x80560000) で CreateSession が失敗するようになっていた。明示的に CloseSession
      * を送ってセッションを解放する。応答は待たない (teardown なので best-effort)。
      * CloseSession Request TypeId = NodeId 473 (0x01D9, FourByte)。
-     * body = deleteSubscriptions (Boolean, 1B)。 */
+     * body = deleteSubscriptions (Boolean, 1B)。
+     * seqNum は直前のサービス列の続き (close_seq) を使う。固定値 5 のままだと
+     * 複数サービスを流したときに巻き戻り、サーバに拒否される。 */
     {
         static const uint8_t CLOSESESS_TYPEID[4] = { 0x01, 0x00, 0xd9, 0x01 };
         uint32_t rh_len;
-        uint8_t *rh = build_request_header(auth_tok, auth_tok_len, 5, &rh_len);
+        uint8_t *rh = build_request_header(auth_tok, auth_tok_len, close_seq, &rh_len);
         if (rh) {
             uint8_t cs_body[1] = { 0x01 };  /* deleteSubscriptions = true */
             uint32_t cs_len;
-            uint8_t *cs = build_msg(channel_id, token_id, 5, 5,
+            uint8_t *cs = build_msg(channel_id, token_id, close_seq, close_seq,
                                     CLOSESESS_TYPEID, 4, rh, rh_len,
                                     cs_body, 1, &cs_len);
             free(rh);
@@ -870,5 +1016,6 @@ int main(int argc, char *argv[]) {
 done:
     close(sockfd);
     free(fuzz_body);
+    free_services(services, n_services);
     return rc;
 }
