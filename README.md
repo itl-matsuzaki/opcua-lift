@@ -124,6 +124,59 @@ stdout : u32 magic("LIFT"=0x5446494c) ; u32 node_id ; u32 resp_len ; u8 resp[]  
 単一サービスモードの出力契約は変わりません（生の応答バイト列をそのまま stdout に出す）。
 既存の呼び出し側は影響を受けません。
 
+#### 応答から次の要求へ値を運ぶ（script v2）
+
+サーバが返す値の中には、**それを発行したセッションの中でしか通用しないもの**があります。
+Browse の `continuationPoint` が典型です。一度 Browse して得た値をファイルに保存し、
+後で BrowseNext に渡しても `Bad_ContinuationPointInvalid` (0x804A0000) になります。
+`--multi` のスクリプトに直接書き込んでも同じで、その値は前のセッションのものだからです。
+
+そのため、**セッションが開いている間に応答から要求へ値を移す**必要があります。
+これはこのプロセスにしかできません。script v2 はそのためのものです。
+
+```text
+script v2 : "LFTS" ; u32 version(=2) ;
+              { u32 node_id ; u32 body_len ; u8 body[] ;
+                u32 patch_count ;
+                  { u32 src_index ; u32 src_off ; u32 dst_off ; u32 len }* }*  の繰り返し
+```
+
+- `src_index` … 何番目の要求の応答から読むか（自分より前に限る）
+- `src_off` … その**サービスペイロード内**のオフセット。MSG ヘッダ・応答 TypeId・
+  ResponseHeader を通過した後を 0 とするので、サーバごとに長さが変わる
+  ResponseHeader をスクリプト側が知る必要はありません
+- `dst_off` / `len` … この要求のボディのどこへ何バイト書くか
+
+ヘッダのない従来のスクリプトは v1 として今までどおり動きます。patch_count を
+足して書き直す必要はありません。
+
+適用できない patch（存在しない応答を参照する、ボディの外に書く、応答が返らなかった）は
+**その場で失敗させます**。読み飛ばして送っても応答は返ってくるので、
+結果らしきものが出てしまい、実際には何も測れていない状態になるからです。
+
+Browse → BrowseNext の例:
+
+```python
+# BrowseResponse のペイロード: results数(4) + statusCode(4) + CP長(4) + CP実体
+# BrowseNext のボディ:        release(1) + 個数(4) + CP長(4) + CP実体
+script  = struct.pack('<4sI', b'LFTS', 2)
+script += struct.pack('<II', 527, len(browse_body)) + browse_body + struct.pack('<I', 0)
+script += struct.pack('<II', 533, len(bnext_body))  + bnext_body  + struct.pack('<I', 1)
+script += struct.pack('<IIII', 0, 12, 9, 16)   # 応答0の12バイト目から16バイトを、9バイト目へ
+```
+
+open62541 v1.3.4 で実測した効果:
+
+| | BrowseNext の結果 |
+|---|---|
+| 単発 replay（有効な CP を作る手段がない） | `0x804A0000` Bad_ContinuationPointInvalid |
+| script v2 で値コピー | `0x00000000` Good |
+
+カバレッジで見ると、シーケンス側だけが `ua_services_view.c` の 24 行
+（`browseWithContinuation` と継続位置の探索ループ）に到達します。
+`continuationPoint` はサーバ側で `session->continuationPoints` に繋がれているため、
+単発 replay ではこの経路に**原理的に**到達できません。
+
 ### 環境変数
 
 ActivateSession の身元確認トークンは実装ごとに受け付ける形が違います。**実装ごとの

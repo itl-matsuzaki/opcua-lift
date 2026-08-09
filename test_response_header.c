@@ -121,6 +121,63 @@ int main(void) {
         else printf("PASS %-34s 切り詰めは fail closed\n", "truncation");
     }
 
+    /* --- script parsing ------------------------------------------------
+     * v1 scripts must keep parsing unchanged, and a v2 script must reject any
+     * patch it cannot apply safely. A patch that reads from a response that
+     * does not exist yet, or that writes past the end of the body it targets,
+     * is a malformed script -- accepting it would mean sending a request built
+     * from whatever happened to be in memory. */
+    {
+        lift_service_t *svcs = NULL;
+        uint32_t n = 0;
+
+        /* v1: {node_id=631, body_len=2, body} -- no header, no patch count */
+        uint8_t v1[] = { 0x77,0x02,0,0,  2,0,0,0,  0xAA,0xBB };
+        if (parse_script(v1, sizeof(v1), &svcs, &n) == 0 && n == 1 &&
+            svcs[0].node_id == 631 && svcs[0].body_len == 2 && svcs[0].n_patches == 0) {
+            printf("PASS %-34s v1 は従来どおり\n", "script v1 (no header)");
+        } else { printf("FAIL v1 script\n"); failures++; }
+        free_services(svcs, n); svcs = NULL; n = 0;
+
+        /* v2 with one in-range patch */
+        uint8_t v2[] = { 'L','F','T','S', 2,0,0,0,
+                         0x0F,0x02,0,0, 4,0,0,0, 1,2,3,4, 0,0,0,0,          /* svc0, 0 patches */
+                         0x15,0x02,0,0, 8,0,0,0, 1,2,3,4,5,6,7,8, 1,0,0,0, /* svc1, 1 patch  */
+                         0,0,0,0,  12,0,0,0,  4,0,0,0,  4,0,0,0 };
+        if (parse_script(v2, sizeof(v2), &svcs, &n) == 0 && n == 2 &&
+            svcs[1].n_patches == 1 && svcs[1].patches[0].src_index == 0 &&
+            svcs[1].patches[0].src_off == 12 && svcs[1].patches[0].dst_off == 4 &&
+            svcs[1].patches[0].len == 4) {
+            printf("PASS %-34s patch が読める\n", "script v2");
+        } else { printf("FAIL v2 script\n"); failures++; }
+        free_services(svcs, n); svcs = NULL; n = 0;
+
+        /* src_index points at this very request: no response exists yet */
+        uint8_t fwd[] = { 'L','F','T','S', 2,0,0,0,
+                          0x15,0x02,0,0, 8,0,0,0, 1,2,3,4,5,6,7,8, 1,0,0,0,
+                          0,0,0,0,  0,0,0,0,  0,0,0,0,  4,0,0,0 };
+        if (parse_script(fwd, sizeof(fwd), &svcs, &n) < 0) {
+            printf("PASS %-34s 自分自身の応答は参照不可\n", "patch src_index >= self");
+        } else { printf("FAIL forward reference accepted\n"); failures++; free_services(svcs, n); }
+        svcs = NULL; n = 0;
+
+        /* dst_off + len runs past the end of an 8-byte body */
+        uint8_t ovf[] = { 'L','F','T','S', 2,0,0,0,
+                          0x0F,0x02,0,0, 4,0,0,0, 1,2,3,4, 0,0,0,0,
+                          0x15,0x02,0,0, 8,0,0,0, 1,2,3,4,5,6,7,8, 1,0,0,0,
+                          0,0,0,0,  0,0,0,0,  6,0,0,0,  4,0,0,0 };
+        if (parse_script(ovf, sizeof(ovf), &svcs, &n) < 0) {
+            printf("PASS %-34s body 外への書き込みを拒否\n", "patch dst overflow");
+        } else { printf("FAIL out-of-range dst accepted\n"); failures++; free_services(svcs, n); }
+        svcs = NULL; n = 0;
+
+        /* An unknown version must not be parsed as if it were understood */
+        uint8_t ver[] = { 'L','F','T','S', 99,0,0,0 };
+        if (parse_script(ver, sizeof(ver), &svcs, &n) < 0) {
+            printf("PASS %-34s 未知バージョンを拒否\n", "script version guard");
+        } else { printf("FAIL unknown version accepted\n"); failures++; free_services(svcs, n); }
+    }
+
     printf("\n%s\n", failures ? "FAILURES" : "all passed");
     return failures ? 1 : 0;
 }
