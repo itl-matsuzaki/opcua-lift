@@ -588,27 +588,77 @@ static uint8_t *build_request_header(const uint8_t *auth_tok, uint32_t auth_tok_
  * Main
  * ----------------------------------------------------------------------- */
 
+/* Copy bytes out of an earlier response and into this request's body before it
+ * is sent.
+ *
+ * Some state a server hands back is scoped to the session that produced it, so
+ * it cannot be captured in one run and replayed from a file in the next. A
+ * Browse continuationPoint is the clearest case: browse once, and BrowseNext
+ * with that continuationPoint answers Bad_ContinuationPointInvalid (0x804A0000)
+ * in any other session — including a later --multi run that has the value baked
+ * into its script. The value has to move from response to request while the
+ * session that owns it is still open, which is something only this process can
+ * do.
+ *
+ * src_off and dst_off are relative to the *service* payload, i.e. after the MSG
+ * header, the response TypeId and the (variable-length) ResponseHeader. That
+ * keeps a script from having to know how long a particular server's
+ * ResponseHeader happens to be. */
+typedef struct {
+    uint32_t src_index;   /* which earlier request's response to read from */
+    uint32_t src_off;     /* offset into that service response payload */
+    uint32_t dst_off;     /* offset into this request's body */
+    uint32_t len;
+} lift_patch_t;
+
 /* One service request to drive over the session. */
 typedef struct {
     uint32_t node_id;
     uint8_t *body;
     uint32_t body_len;
+    lift_patch_t *patches;
+    uint32_t n_patches;
 } lift_service_t;
 
-#define LIFT_MULTI_MAGIC  0x5446494cu   /* "LIFT" little-endian */
+#define LIFT_MULTI_MAGIC  0x5446494cu   /* "LIFT" little-endian, response framing */
+#define LIFT_SCRIPT_MAGIC 0x5354464cu   /* "LFTS" little-endian, script v2 header */
+#define LIFT_SCRIPT_VER   2u
 #define LIFT_MAX_SERVICES 4096u
+#define LIFT_MAX_PATCHES  64u
 
 static void free_services(lift_service_t *svcs, uint32_t n) {
     if (!svcs) return;
-    for (uint32_t i = 0; i < n; i++) free(svcs[i].body);
+    for (uint32_t i = 0; i < n; i++) { free(svcs[i].body); free(svcs[i].patches); }
     free(svcs);
 }
 
-/* Parse the multi-service script: repeated {u32 node_id, u32 body_len, body}. */
+/* Parse the multi-service script.
+ *
+ *   v1 (no header):  { u32 node_id ; u32 body_len ; u8 body[] }*
+ *   v2 ("LFTS", u32 version=2):
+ *                    { u32 node_id ; u32 body_len ; u8 body[] ;
+ *                      u32 patch_count ;
+ *                        { u32 src_index ; u32 src_off ; u32 dst_off ; u32 len }* }*
+ *
+ * v1 scripts keep working unchanged: the header is what selects v2, so nothing
+ * that ran before needs rewriting to carry an empty patch count. */
 static int parse_script(const uint8_t *buf, uint32_t len,
                         lift_service_t **out, uint32_t *out_n) {
     lift_service_t *svcs = NULL;
     uint32_t n = 0, off = 0;
+    int v2 = 0;
+
+    if (len >= 8 && rd_le32(buf) == LIFT_SCRIPT_MAGIC) {
+        uint32_t ver = rd_le32(buf + 4);
+        if (ver != LIFT_SCRIPT_VER) {
+            fprintf(stderr, "[opcua-lift] unsupported script version %u "
+                            "(this build understands %u)\n", ver, LIFT_SCRIPT_VER);
+            return -1;
+        }
+        v2 = 1;
+        off = 8;
+    }
+
     while (off + 8 <= len) {
         uint32_t node_id = rd_le32(buf + off);
         uint32_t body_len = rd_le32(buf + off + 4);
@@ -621,12 +671,40 @@ static int parse_script(const uint8_t *buf, uint32_t len,
         svcs[n].node_id = node_id;
         svcs[n].body_len = body_len;
         svcs[n].body = NULL;
+        svcs[n].patches = NULL;
+        svcs[n].n_patches = 0;
         if (body_len > 0) {
             svcs[n].body = malloc(body_len);
             if (!svcs[n].body) { n++; goto bad; }
             memcpy(svcs[n].body, buf + off, body_len);
         }
         off += body_len;
+
+        if (v2) {
+            if (off + 4 > len) { n++; goto bad; }
+            uint32_t np = rd_le32(buf + off); off += 4;
+            if (np > LIFT_MAX_PATCHES) { n++; goto bad; }
+            if (np > 0) {
+                if ((len - off) / 16 < np) { n++; goto bad; }
+                svcs[n].patches = malloc(np * sizeof(lift_patch_t));
+                if (!svcs[n].patches) { n++; goto bad; }
+                for (uint32_t p = 0; p < np; p++) {
+                    svcs[n].patches[p].src_index = rd_le32(buf + off + 0);
+                    svcs[n].patches[p].src_off   = rd_le32(buf + off + 4);
+                    svcs[n].patches[p].dst_off   = rd_le32(buf + off + 8);
+                    svcs[n].patches[p].len       = rd_le32(buf + off + 12);
+                    off += 16;
+                    /* A patch may only read a response that already exists when
+                     * this request is built, and must land inside this body. */
+                    const lift_patch_t *pa = &svcs[n].patches[p];
+                    if (pa->src_index >= n) { svcs[n].n_patches = p + 1; n++; goto bad; }
+                    if (pa->len > body_len || pa->dst_off > body_len - pa->len) {
+                        svcs[n].n_patches = p + 1; n++; goto bad;
+                    }
+                }
+                svcs[n].n_patches = np;
+            }
+        }
         n++;
     }
     if (off != len || n == 0) goto bad;             /* trailing bytes = malformed script */
@@ -636,6 +714,16 @@ static int parse_script(const uint8_t *buf, uint32_t len,
 bad:
     free_services(svcs, n);
     return -1;
+}
+
+/* Offset of the service payload inside a raw response: past the 24-byte MSG
+ * header, the response TypeId, and the ResponseHeader. Returns 0 if the
+ * response is too short or malformed to locate it. */
+static uint32_t service_payload_offset(const uint8_t *resp, uint32_t resp_len) {
+    if (resp_len <= 24) return 0;
+    uint32_t tl = nodeid_wire_len(resp, resp_len, 24);
+    if (tl == 0) return 0;
+    return skip_response_header(resp, resp_len, 24 + tl, NULL);
 }
 
 /* Receive one logical service response: keep reading while the server sends
@@ -913,8 +1001,58 @@ int main(int argc, char *argv[]) {
      * unanswered, and later requests may still succeed. */
     {
         uint32_t seq = 4;
+        /* Responses are kept for the whole session so later requests can copy
+         * session-scoped values (continuationPoint, subscriptionId) out of
+         * them. Freed together at the end of the loop. */
+        uint8_t **saved = NULL;
+        uint32_t *saved_len = NULL;
+        if (n_services > 1) {
+            saved = calloc(n_services, sizeof(*saved));
+            saved_len = calloc(n_services, sizeof(*saved_len));
+            if (!saved || !saved_len) {
+                fprintf(stderr, "[opcua-lift] OOM\n");
+                free(saved); free(saved_len);
+                goto done;
+            }
+        }
+
         for (uint32_t i = 0; i < n_services; i++) {
             uint32_t sid = services[i].node_id;
+
+            /* Splice in values from earlier responses. A patch that cannot be
+             * applied is fatal rather than skipped: sending the request with a
+             * stale or zero value would still get a response, and that response
+             * would look like a result while measuring nothing. */
+            for (uint32_t p = 0; p < services[i].n_patches; p++) {
+                const lift_patch_t *pa = &services[i].patches[p];
+                uint8_t *src = saved ? saved[pa->src_index] : NULL;
+                uint32_t src_len = saved_len ? saved_len[pa->src_index] : 0;
+                if (!src || src_len == 0) {
+                    fprintf(stderr, "[opcua-lift] service %u: patch %u needs the response "
+                                    "to service %u, which did not answer\n",
+                            i, p, pa->src_index);
+                    goto patch_failed;
+                }
+                uint32_t base = service_payload_offset(src, src_len);
+                if (base == 0) {
+                    fprintf(stderr, "[opcua-lift] service %u: patch %u cannot locate the "
+                                    "service payload in the response to service %u\n",
+                            i, p, pa->src_index);
+                    goto patch_failed;
+                }
+                if (pa->len > src_len - base || pa->src_off > src_len - base - pa->len) {
+                    fprintf(stderr, "[opcua-lift] service %u: patch %u reads %u bytes at "
+                                    "offset %u, past the %u-byte payload of service %u\n",
+                            i, p, pa->len, pa->src_off, src_len - base, pa->src_index);
+                    goto patch_failed;
+                }
+                memcpy(services[i].body + pa->dst_off, src + base + pa->src_off, pa->len);
+                continue;
+            patch_failed:
+                for (uint32_t k = 0; k < n_services; k++) if (saved) free(saved[k]);
+                free(saved); free(saved_len);
+                goto done;
+            }
 
             /* NodeId encoding: FourByte numeric (enc=0x01) for IDs <= 65535 */
             uint8_t nodeid_bytes[4];
@@ -978,7 +1116,18 @@ int main(int argc, char *argv[]) {
                  * bytes on stdout, nothing else. */
                 fwrite(response_buf, 1, response_buf_size, stdout);
             }
-            free(response_buf);
+
+            if (saved) {
+                saved[i] = response_buf;          /* ownership moves to saved[] */
+                saved_len[i] = response_buf_size;
+            } else {
+                free(response_buf);
+            }
+        }
+        if (saved) {
+            for (uint32_t k = 0; k < n_services; k++) free(saved[k]);
+            free(saved);
+            free(saved_len);
         }
         fprintf(stderr, "\n");
         fflush(stdout);
