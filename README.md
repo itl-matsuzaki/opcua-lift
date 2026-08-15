@@ -1,5 +1,19 @@
 # opcua-lift — OPC UA Stateful Corpus Replay
 
+> **In English.** `opcua-lift` takes a *raw OPC UA service-request body* — the
+> kind produced by function-level fuzzing of `UA_decodeBinary` with AFL++ or
+> SymCC — and executes it against a **live, unmodified** OPC UA server by
+> re-establishing a full session first. It performs the
+> `HEL → ACK → OPN → CreateSession → ActivateSession` handshake, extracts the
+> session-dependent fields (channelId, tokenId, seqNum, requestId, authToken)
+> from the server's own responses, patches them into the request, and sends it.
+> That is the *Stateful Replay* mechanism of the ICSENG 2026 paper below.
+> It is self-contained: no AFLNet checkout, no `aflnet.o`, builds with `cc`.
+> `--multi` drives a sequence of service requests over one session.
+> **The body of this README is in Japanese**; the source comments, `--help`
+> output, and the [Scope and limitations](#scope-and-limitations) section below
+> are in English.
+
 関数レベル（`UA_decodeBinary` 等）のファジングで得た **生のサービス要求ボディ**を、
 **ライブの OPC UA サーバに対してフルセッションを張り直して**送り込み、応答を観測する
 スタンドアロンツールです。AFLNet ツリーから切り出した自己完結版で、**AFLNet の
@@ -124,6 +138,42 @@ stdout : u32 magic("LIFT"=0x5446494c) ; u32 node_id ; u32 resp_len ; u8 resp[]  
 
 単一サービスモードの出力契約は変わりません（生の応答バイト列をそのまま stdout に出す）。
 既存の呼び出し側は影響を受けません。
+
+#### 注意: 単一サービスモードは「動いているように見えて」何も測れていないことがある
+
+**これは失敗として現れません。**応答は返り、state code も出て、exit 0 になります。
+気づかないまま測り続けられてしまうので、先に書いておきます。
+
+アプリケーション層を持つ SUT（OPC Foundation の Boiler コンパニオンモデルに沿った
+アドレス空間の上に、制御ループ・値域検査・状態機械・インタロックを載せたもの。
+本リポジトリには含みません）を C 実装で用意し、gcov で実測した結果です。
+
+| 駆動方法 | Lines | Taken at least once |
+|---|---|---|
+| 生バイト再送 | 64.84% | 7.92% |
+| opcua-lift 単一サービス | 64.84% | 7.92% |
+| opcua-lift `--multi` | 93.41% | 63.37% |
+| 実クライアント（上限） | 94.51% | 70.30% |
+
+**単一サービスモードが生バイト再送と同じ数字**である点が要点です。この 64.84% は
+起動時のアドレス空間構築だけで、制御ループは一度も回っていません。原因は 2 つ:
+
+1. **きれいに閉じたセッションの「最後の MSG」は `CloseSession` です。**
+   捕捉セッションから末尾 1 件を取り出す作り方をしていると、replay しているのは
+   1 バイトの `CloseSession` になります。手元の seed では boiler 系 7 本すべて、
+   汎用 opcua 系 4 本中 2 本がこれに該当していました。
+2. **要求 1 件につき状態が 1 歩しか進みません。** 1 Write = 1 tick の対象では、
+   約 25 tick 必要なインタロックのトリップに単一サービスでは原理的に到達できません。
+
+アプリケーション層のある対象を測るなら `--multi` を使ってください。単一サービスモードは
+メッセージ復号層（`UA_decodeBinary` 相当）を狙う用途のものです。
+
+#### 注意: session 外の discovery サービスは `--multi` に載せられない
+
+`GetEndpoints`（NodeId 428）などの discovery サービスはセッションの外で処理されるため、
+`--multi` のスクリプトには含められません。捕捉セッションから要求列を抽出する際は
+抽出対象外になり、その seed では `--multi` が成立しません。仕様どおりの挙動なので、
+呼び出し側で単一サービス経路にフォールバックしてください。
 
 #### 応答から次の要求へ値を運ぶ（script v2）
 
@@ -346,3 +396,117 @@ open62541 v1.3.4 セッション（`localhost:4840`、SecurityPolicy=None、匿�
 endpointUrl 文字列（`opc.tcp://localhost:4840`）はそのまま送られますが、open62541 は
 通常これを厳密検証しないため接続は成立します。厳密な endpoint 検証を行うサーバが
 相手の場合は、これらのバイト列内の URL を調整してください。
+
+---
+
+## Scope and limitations
+
+These are design boundaries, not open bugs. Read them before filing an issue.
+
+- **SecurityMode `None` only.** The baseline handshake is captured from an
+  unencrypted, anonymous session. `Sign` and `SignAndEncrypt` endpoints are not
+  supported. This is why the tool cannot be pointed at a hardened production
+  server as-is.
+- **The handshake prefix is fixed.** `BASE_HEL` / `BASE_OPN` /
+  `BASE_CREATESESSION` are literal captured bytes with runtime field patching.
+  Consequently the tool **cannot** exercise bugs in certificate validation,
+  trust-list handling, or the secure-channel negotiation itself — only the
+  service-dispatch layer reached *after* a session exists.
+- **`endpointUrl` is hardcoded** as `opc.tcp://localhost:4840`. Servers that
+  strictly validate it need that string edited in the baseline bytes
+  (see the section above).
+- **OPC UA binary transport only.** No HTTPS/WebSocket transport, no PubSub.
+- **Not a fuzzer.** It replays inputs someone else generated. Input generation
+  (AFLNet / AFL++ / SymCC) lives outside this repository.
+
+### Validated targets
+
+Measured 2026-08-15, single replay and `--multi` with a 3-request script.
+Per-implementation work is *only* the identity-token environment variable
+(see [環境変数](#環境変数)); no code changes are needed.
+
+| Implementation | Identity token | Single | `--multi` (3 requests) |
+|---|---|---|---|
+| open62541 v1.4.6 | `OPCUA_LIFT_ANON_V14=1` | OK | 3 records, 52 B response |
+| open62541 v1.3.9 | default (username) or `OPCUA_LIFT_ANON=1` | OK | 3 records, 52 B response |
+| Eclipse Milo 0.6.12 (JRE 17) | `OPCUA_LIFT_ANON=1` | OK | 3 records |
+| UA-.NETStandard 2.0.0-preview-20260718 | `OPCUA_LIFT_ANON=1` or `ANON_V14=1` | OK | 3 records, 133 B response |
+| S2OPC | — | not verified (unrelated harness issue) | — |
+
+Testing against more than one stack is not a formality — two defects were
+reachable *only* off open62541, because open62541 happens to exercise the
+narrow path:
+
+1. **`ResponseHeader` was assumed to be a fixed 24 bytes.** open62541 returns
+   the minimal form, so this never surfaces against it. A server that returns
+   `serviceDiagnostics` or a non-empty `stringTable` shifts `sessionId` and
+   `authToken`, and everything afterwards fails to decode — which *looks like a
+   bug in the target*, silently corrupting measurements. Now walked by
+   `skip_response_header()` / `skip_diagnostic_info()` and pinned by
+   `test_response_header.c` (`make test`).
+2. **`authToken` was capped at 32 bytes.** Milo returns a 32-byte random opaque
+   (ByteString) NodeId, 39 bytes on the wire — spec-conformant, so a 32-byte cap
+   could never work against Milo. `AUTH_TOK_MAX` is now 128.
+
+### Operational notes
+
+- **Against a target with an application layer, single-service mode can measure
+  almost nothing while appearing to work** — it returns a response, prints state
+  codes, and exits 0. On an application-layer SUT (a Boiler companion-model
+  address space with a control loop, range checks, a state machine and an
+  interlock; not included here), gcov gave 64.84% lines / 7.92% branches taken
+  for both raw byte resend *and* single-service replay, versus 93.41% / 63.37%
+  for `--multi` — against 94.51% / 70.30% for a real client. Two causes: the
+  last MSG of a cleanly closed captured session is `CloseSession` (a 1-byte
+  request), and one request advances the target by one tick, so a state ~25
+  ticks deep is unreachable by construction. Use `--multi` for anything above
+  the message-decoding layer. Details in
+  [単一サービスモードは「動いているように見えて」何も測れていないことがある](#注意-単一サービスモードは動いているように見えて何も測れていないことがある).
+- **Discovery services cannot go in a `--multi` script.** `GetEndpoints`
+  (NodeId 428) and friends are handled outside the session, so a seed whose
+  requests are discovery-only yields no usable `--multi` script; fall back to
+  the single-service path.
+- **Never replay against a fuzzing-instrumented build of the target.** Under
+  `FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION`, open62541 deliberately tampers
+  with the authentication token, so `ActivateSession` cannot succeed with *any*
+  identity token. Use a clean build as the replay target; keep coverage or
+  sanitizer instrumentation, but not fuzzing-mode instrumentation.
+- **Do not assume a response size.** The same `ReadRequest` yields 52 bytes from
+  open62541 and 133 bytes from UA-.NETStandard. Callers must read the framed
+  length, not a constant.
+- **JVM targets need a longer timeout.** Milo delays its `HEL` response when
+  sessions are opened back to back; at the default 5 s this surfaces as
+  `HEL/ACK failed: no response`. Raise `OPCUA_LIFT_TIMEOUT`.
+- **`smoke-test.sh` assumes a locally executable server binary** and therefore
+  does not cover containerised or JVM targets (Milo, UA-.NETStandard). It is one
+  check, not the verification story. Reproduce those with a published Docker
+  port:
+
+  ```sh
+  make && make test
+  OPCUA_LIFT_ANON_V14=1 ./opcua-lift testcases/readrequest_body.raw 14840 631 127.0.0.1
+  OPCUA_LIFT_ANON=1     ./opcua-lift testcases/readrequest_body.raw 14843 631 127.0.0.1
+  ```
+
+## License
+
+Apache License 2.0 — see [`LICENSE`](LICENSE). This package is extracted from
+AFLNet; provenance and attribution are recorded in [`NOTICE.md`](NOTICE.md).
+
+## Citation
+
+If you use this tool in academic work, please cite:
+
+```bibtex
+@inproceedings{Matsuzaki2026StatefulReplay,
+  author    = {Kazutaka Matsuzaki and Shinichi Honiden},
+  title     = {Stateful Replay for Combining State-Oriented Fuzzing and
+               Symbolic Execution in Industrial Protocol Testing},
+  booktitle = {Proceedings of the International Conference on Systems
+               Engineering (ICSENG)},
+  year      = {2026}
+}
+```
+
+This work was supported by JSPS KAKENHI Grant Number JP24K07969 and by the
+Telecommunications Advancement Foundation (TAF).
