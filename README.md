@@ -42,8 +42,9 @@ HEL ─▶ ACK ─▶ OPN ─▶ CreateSession ─▶ ActivateSession ─▶ [�
 | `alloc-shim.h`  | `ck_alloc/ck_realloc/ck_free` を libc の `malloc` 系で実装した最小シム（`alloc-inl.h`/`config.h`/`types.h`/`debug.h` を不要化） |
 | `Makefile`      | 自己完結ビルド |
 | `replay.sh`     | service 名 → NodeId を解決する replay ラッパ |
-| `smoke-test.sh` | サーバ起動〜replay の end-to-end 動作確認 |
-| `testcases/readrequest_body.raw` | サンプル入力 |
+| `smoke-test.sh` | サーバ起動〜replay の end-to-end 動作確認（単一・`--multi` の両方）|
+| `multi.py`      | `--multi` スクリプトの生成と、返ってきた framed 応答の読み取り（任意。ビルドには不要）|
+| `testcases/`    | サンプル入力（[サンプル](#サンプル)）|
 
 > 互換性メモ: `opcua_state.c` は `aflnet.c`（commit `212b578`、AFLNet OPCUA 拡張）から
 > 逐語で移植しています。上流の同関数が変わったら再移植すれば `aflnet-replay` と
@@ -177,6 +178,85 @@ open62541 v1.3.4 で実測した効果:
 `continuationPoint` はサーバ側で `session->continuationPoints` に繋がれているため、
 単発 replay ではこの経路に**原理的に**到達できません。
 
+### サンプル
+
+`testcases/` に **そのまま動く `--multi` スクリプトが 2 本**入っています。
+生成と読み取りは `multi.py`（標準ライブラリのみ。C のビルドには不要）で行います。
+
+| ファイル | 中身 |
+|---|---|
+| `read_currenttime_body.raw` | `Server_ServerStatus_CurrentTime` (i=2258) の Value を読む Read ボディ |
+| `browse_body.raw` | RootFolder (i=84) を `requestedMaxReferencesPerNode = 1` で Browse するボディ。**必ず continuationPoint が返る** |
+| `browsenext_body.raw` | BrowseNext ボディ。continuationPoint の場所は 16 バイトの 0 で埋めてある |
+| **`multi_read3.script`** | script v1。同じ Read を 1 セッションで 3 回 |
+| **`multi_browse_next.script`** | script v2。Browse → BrowseNext で continuationPoint を運ぶ |
+
+```sh
+./opcua-lift --multi testcases/multi_read3.script 4840 127.0.0.1 | ./multi.py decode -
+```
+
+```text
+[0] node=631  len=70    MSGF  serviceResult=0x00000000 Good
+[1] node=631  len=70    MSGF  serviceResult=0x00000000 Good
+[2] node=631  len=70    MSGF  serviceResult=0x00000000 Good
+```
+
+3 要求が 1 セッションで流れ、`seqNum` が巻き戻らずに 3 応答が対で返ることの確認です。
+
+```sh
+./opcua-lift --multi testcases/multi_browse_next.script 4840 127.0.0.1 | ./multi.py decode -
+```
+
+```text
+[0] node=527  len=128   MSGF  serviceResult=0x00000000 Good  results[0]=0x00000000 Good
+[1] node=533  len=124   MSGF  serviceResult=0x00000000 Good  results[0]=0x00000000 Good
+```
+
+**`results[0]` を見てください。** patch を外して同じ 2 要求を送ると、BrowseNext は
+`results[0]=0x804A0000 Bad_ContinuationPointInvalid` になります。
+`serviceResult` はどちらも `Good` なので、**サービス単位の結果だけ見ていると
+「動いている」ように見えます**。この差が script v2 の効果そのものです。
+
+```sh
+# patch なし（対照）: continuationPoint はプレースホルダの 0 のままになる
+./multi.py build /tmp/nopatch.script browse:testcases/browse_body.raw \
+                                     browsenext:testcases/browsenext_body.raw
+```
+
+#### `multi.py`
+
+```sh
+# 生成: <service>:<body ファイル>[+<src>,<src_off>,<dst_off>,<len>]...
+./multi.py build out.script read:body.raw read:body.raw
+./multi.py build out.script browse:testcases/browse_body.raw \
+                            'browsenext:testcases/browsenext_body.raw+0,12,9,16'
+
+# 読み取り: 1 要求 1 行。'-' は標準入力
+./opcua-lift --multi out.script 4840 > out.bin && ./multi.py decode out.bin
+./multi.py decode out.bin --hex 32        # 生バイトも見る
+```
+
+patch を 1 つでも付けると script v2 になります。service 名は `replay.sh` と同じ
+（`read` / `write` / `browse` / `browsenext` / `call`）で、10 進の NodeId も直接書けます。
+
+`+0,12,9,16` は「**0 番目の応答**のサービスペイロード **12 バイト目**から
+**16 バイト**を、この要求のボディの **9 バイト目**へ書く」という意味です。
+
+```text
+BrowseResponse のペイロード : results数(4) + statusCode(4) + CP長(4) + CP実体  → CP は 12
+BrowseNext のボディ         : release(1)   + 個数(4)      + CP長(4) + CP実体  → CP は 9
+```
+
+> **`len` は continuationPoint の長さに依存します。** サンプルの 16 は実測値で、
+> open62541 v1.4.6 / v1.3.9・Eclipse Milo 0.6.12・UA-.NETStandard の 4 実装すべてで
+> 16 バイトでした。別の実装で合わない場合は、まず Browse だけを流して
+> `./multi.py decode out.bin --hex 40` で CP 長（ペイロード 8 バイト目の Int32）を
+> 確認してください。
+
+サンプルは上記 4 実装で実行を確認しています。応答長は実装ごとに違い
+（同じ Read で open62541 70B、`readrequest_body.raw` では 52B と 133B）、
+**応答サイズを決め打ちしないこと**の実例にもなっています。
+
 ### 環境変数
 
 ActivateSession の身元確認トークンは実装ごとに受け付ける形が違います。**実装ごとの
@@ -230,10 +310,17 @@ JVM 実装（Milo）はセッションを連続して張ると HEL の応答が�
 
 ```sh
 ./smoke-test.sh /path/to/tutorial_server_variable 4840
+OPCUA_LIFT_ANON=1 ./smoke-test.sh /path/to/server 4840   # 匿名が要るサーバ
 ```
 
-成功すると state code（例 `0-0-`）と生応答が出て `exit=0` になります。
+単一サービスの replay に続けて、`testcases/` のサンプル `--multi` スクリプト 2 本を
+流します。成功すると state code（例 `0-0-`）と生応答、続いて 1 要求 1 行の
+デコード結果が出て `exit=0` になります（デコードには python3 を使いますが、
+無ければその段だけ飛ばします）。
+
 検証済みターゲット例: open62541 v1.3.4 の `examples/tutorial_server_variable`。
+`--multi` を含むサンプルは open62541 v1.4.6 / v1.3.9・Eclipse Milo 0.6.12・
+UA-.NETStandard でも実行を確認しています。
 
 ---
 
