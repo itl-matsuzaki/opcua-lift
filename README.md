@@ -29,7 +29,7 @@ tokenId, seqNum, requestId, authToken）は実行時にサーバ応答から取�
 これが「ステートフル replay」の本体です。
 
 `--multi` を使うと、1 セッションで**複数のサービス要求を順に流し**、要求と応答を対にして
-取り出せます（[複数サービスモード](#複数サービスモードmulti)）。
+取り出せます（[複数サービスモード](#複数サービスモード--multi)）。
 
 ```
 HEL ─▶ ACK ─▶ OPN ─▶ CreateSession ─▶ ActivateSession ─▶ [サービス列] ─▶ CloseSession
