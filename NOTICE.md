@@ -10,4 +10,12 @@ which is licensed under the **Apache License 2.0**.
   code; it is written for this standalone package.
 
 If redistributing, retain the AFLNet copyright/notice per Apache-2.0 §4.
-The upstream `LICENSE` (Apache-2.0) governs the lifted source.
+The `LICENSE` file in this repository is that Apache-2.0 license text; it
+governs the lifted source and, for consistency, this package as a whole.
+
+- AFLNet: Copyright the AFLNet authors (Van-Thuan Pham, Marcel Böhme,
+  Abhik Roychoudhury), licensed under Apache-2.0.
+- AFL, from which AFLNet derives: Copyright 2013–2016 Google Inc.,
+  licensed under Apache-2.0.
+- Additions in this package: Copyright 2026 Kazutaka Matsuzaki,
+  licensed under Apache-2.0.
