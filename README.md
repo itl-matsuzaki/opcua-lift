@@ -7,7 +7,7 @@
 > `HEL → ACK → OPN → CreateSession → ActivateSession` handshake, extracts the
 > session-dependent fields (channelId, tokenId, seqNum, requestId, authToken)
 > from the server's own responses, patches them into the request, and sends it.
-> That is the *Stateful Replay* mechanism of the ICSENG 2026 paper below.
+> That is the *Stateful Replay* mechanism of the ICSEng 2026 paper below.
 > It is self-contained: no AFLNet checkout, no `aflnet.o`, builds with `cc`.
 > `--multi` drives a sequence of service requests over one session.
 > **The body of this README is in Japanese**; the source comments, `--help`
@@ -502,8 +502,11 @@ If you use this tool in academic work, please cite:
   author    = {Kazutaka Matsuzaki and Shinichi Honiden},
   title     = {Stateful Replay for Combining State-Oriented Fuzzing and
                Symbolic Execution in Industrial Protocol Testing},
-  booktitle = {Proceedings of the International Conference on Systems
-               Engineering (ICSENG)},
+  booktitle = {Advances in Systems Engineering: Proceedings of the 52nd
+               International Conference on Systems Engineering, ICSEng 2026,
+               Las Vegas, Nevada, USA, August 20--21, 2026},
+  series    = {Lecture Notes in Networks and Systems},
+  publisher = {Springer},
   year      = {2026}
 }
 ```
