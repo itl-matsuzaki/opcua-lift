@@ -502,8 +502,11 @@ If you use this tool in academic work, please cite:
   author    = {Kazutaka Matsuzaki and Shinichi Honiden},
   title     = {Stateful Replay for Combining State-Oriented Fuzzing and
                Symbolic Execution in Industrial Protocol Testing},
-  booktitle = {Proceedings of the International Conference on Systems
-               Engineering (ICSENG)},
+  booktitle = {Advances in Systems Engineering: Proceedings of the 52nd
+               International Conference on Systems Engineering, ICSEng 2026,
+               Las Vegas, Nevada, USA, August 20--21, 2026},
+  series    = {Lecture Notes in Networks and Systems},
+  publisher = {Springer},
   year      = {2026}
 }
 ```
